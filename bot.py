@@ -557,6 +557,22 @@ def _to_ref(v) -> tuple | None:
     return None
 
 
+def quran_links(q) -> dict:
+    """بيقرا الصيغة {"chat_id": ..., "pages": {"1": رقم_الرسالة, ...}} (زي مفتاح quran في النسخة الاحتياطية)."""
+    if not isinstance(q, dict) or not isinstance(q.get("pages"), dict):
+        return {}
+    chat = q.get("chat_id") or STORAGE_CHANNEL_ID
+    links = {}
+    for k, v in q["pages"].items():
+        try:
+            page, mid = int(en_digits(str(k))), int(v)
+        except (TypeError, ValueError):
+            continue
+        if chat and 1 <= page <= TOTAL_PAGES:
+            links[page] = (chat, mid)
+    return links
+
+
 def load_page_links(path: Path | None = None) -> dict:
     """{رقم الصفحة: (القناة, رقم الرسالة)}. بيقبل JSON (dict أو list) أو ملف نصي."""
     path = path or Path(PAGE_LINKS_FILE)
@@ -567,6 +583,8 @@ def load_page_links(path: Path | None = None) -> dict:
         data = json.loads(raw)
     except ValueError:
         data = None
+    if isinstance(data, dict) and (found := quran_links(data.get("quran", data))):
+        return found
     if isinstance(data, dict):
         items = list(data.items())
     elif isinstance(data, list):
@@ -653,6 +671,24 @@ async def send_pages_local(bot, chat_id: int, pages: list[int]):
             await bot.send_media_group(chat_id, media)
 
 
+class PagesUnavailable(Exception):
+    """الصفحات مش متاحة من قناة التخزين (مش مشكلة عند المستخدم)."""
+
+
+async def copy_run(bot, chat_id: int, src, mids: list[int]):
+    try:
+        sent = await bot.copy_messages(chat_id, src, mids)
+    except BadRequest as e:
+        # بنحوّله لخطأ مستقل عشان "chat not found" متتفسرش غلط إن المستخدم عمل بلوك.
+        log.error("copy_messages failed (source=%s, ids=%s): %s", src, mids, e)
+        raise PagesUnavailable(str(e)) from e
+    if len(sent) < len(mids):
+        log.warning(
+            "Only %d of %d pages were copied from %s (deleted or wrong message ids?)",
+            len(sent), len(mids), src,
+        )
+
+
 async def send_pages(bot, chat_id: int, pages: list[int]):
     """بيبعت الصفحات بالترتيب: اللي ليها رابط في قناة التخزين بتتنسخ منها مباشرة
     (من غير تحميل أو رفع)، واللي مالهاش بتتبعت من الكاش/الـ PDF."""
@@ -660,27 +696,27 @@ async def send_pages(bot, chat_id: int, pages: list[int]):
     while i < len(pages):
         if pages[i] in PAGE_LINKS:
             src = PAGE_LINKS[pages[i]][0]
-            mids = []
+            mids: list[int] = []
             while (
                 i < len(pages)
                 and len(mids) < 100  # حد تليجرام لنسخ الرسايل في طلب واحد
                 and pages[i] in PAGE_LINKS
                 and PAGE_LINKS[pages[i]][0] == src
+                and (not mids or PAGE_LINKS[pages[i]][1] > mids[-1])  # لازم ترتيب تصاعدي
             ):
                 mids.append(PAGE_LINKS[pages[i]][1])
                 i += 1
-            sent = await bot.copy_messages(chat_id, src, mids)
-            if len(sent) < len(mids):
-                log.warning(
-                    "Only %d of %d pages were copied from %s (deleted or wrong message ids?)",
-                    len(sent), len(mids), src,
-                )
+            await copy_run(bot, chat_id, src, mids)
         else:
             run = []
             while i < len(pages) and pages[i] not in PAGE_LINKS:
                 run.append(pages[i])
                 i += 1
-            await send_pages_local(bot, chat_id, run)
+            try:
+                await send_pages_local(bot, chat_id, run)
+            except FileNotFoundError as e:
+                log.error("Pages %s have no link and no local image: %s", run[:5], e)
+                raise PagesUnavailable(str(e)) from e
 
 
 # ───────────────────────── أدوات مساعدة ─────────────────────────
@@ -942,6 +978,21 @@ async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
         log.info("Catch-up: %d users missed today's reminder.", len(due))
 
 
+_last_admin_alert = 0.0
+
+
+async def notify_admins(bot, text: str):
+    """تنبيه للأدمنز (مرة كل ١٠ دقايق بالكتير عشان منغرقهمش)."""
+    global _last_admin_alert
+    now = asyncio.get_running_loop().time()
+    if now - _last_admin_alert < 600:
+        return
+    _last_admin_alert = now
+    for admin_id in ADMIN_IDS:
+        with suppress(TelegramError):
+            await bot.send_message(admin_id, text)
+
+
 async def deliver_today(
     bot, chat_id: int, user, reminder: bool = False, late: bool = False
 ):
@@ -962,7 +1013,14 @@ async def deliver_today(
         chat_id,
         f"{head}\nالصفحات من {ar(pages[0])} لـ {ar(pages[-1])} ({ar(len(pages))} صفحة)",
     )
-    await send_pages(bot, chat_id, pages)
+    try:
+        await send_pages(bot, chat_id, pages)
+    except PagesUnavailable as e:
+        await bot.send_message(
+            chat_id, "⚠️ حصلت مشكلة وأنا بجيب الصفحات. جرّب تاني بعد شوية بإذن الله."
+        )
+        await notify_admins(bot, f"⚠️ فشل إرسال الصفحات {pages[0]}–{pages[-1]}: {e}\nجرّب /checkpages")
+        return
     update_user(chat_id, last_sent=today)
     await bot.send_message(
         chat_id, "لما تخلّص دوس على الزرار 👇", reply_markup=done_keyboard()
@@ -1310,6 +1368,37 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await flush(context.bot, force=True)
 
 
+async def checkpages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تشخيص إرسال الصفحات (للأدمن بس): بيقولك بالظبط فين المشكلة."""
+    if not is_admin(update):
+        return
+    bot, chat_id = context.bot, update.effective_chat.id
+    path = Path(PAGE_LINKS_FILE)
+    lines = [
+        f"🔗 روابط محمّلة: {len(PAGE_LINKS)} من {TOTAL_PAGES}",
+        f"📄 الملف: {path.resolve()} — {'موجود ✅' if path.exists() else 'مش موجود ❌'}",
+    ]
+    for src in sorted({ref[0] for ref in PAGE_LINKS.values()}, key=str):
+        try:
+            chat = await bot.get_chat(src)
+            member = await bot.get_chat_member(src, bot.id)
+            lines.append(f"📦 القناة {src} ({chat.title}): البوت {member.status}")
+            if getattr(chat, "has_protected_content", False):
+                lines.append("⚠️ القناة عليها «منع الحفظ/النسخ»، ده هيمنع البوت ينسخ الصفحات")
+        except TelegramError as e:
+            lines.append(f"❌ مش قادر أوصل للقناة {src}: {e}")
+    ref = PAGE_LINKS.get(1)
+    if ref is None:
+        lines.append("❌ مفيش رابط لصفحة ١")
+    else:
+        try:
+            await bot.copy_message(chat_id, ref[0], ref[1])
+            lines.append(f"✅ نسخت صفحة ١ (رسالة {ref[1]}) بنجاح، المفروض وصلتلك فوق")
+        except TelegramError as e:
+            lines.append(f"❌ فشل نسخ صفحة ١ (رسالة {ref[1]}): {e}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """إحصائيات البوت (للأدمن بس)."""
     if not is_admin(update):
@@ -1642,6 +1731,12 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     global save_lock, outbox, outbox_task, APP
     APP = app
+    save_lock = asyncio.Lock()
+    outbox = Outbox()
+    await restore_state(app.bot)
+    # روابط الصفحات ممكن تيجي من الملف، أو من مفتاح quran جوه النسخة المثبّتة.
+    for page, ref in quran_links(state.get("quran")).items():
+        PAGE_LINKS.setdefault(page, ref)
     log.info("Loaded %d page links from %s.", len(PAGE_LINKS), PAGE_LINKS_FILE)
     for src in {ref[0] for ref in PAGE_LINKS.values()}:
         try:
@@ -1659,9 +1754,6 @@ async def post_init(app: Application):
         )
     else:
         log.info("All %d pages are available.", TOTAL_PAGES)
-    save_lock = asyncio.Lock()
-    outbox = Outbox()
-    await restore_state(app.bot)
     for u in state["users"].values():
         schedule_reminder(app, u)
     outbox_task = asyncio.create_task(outbox.run(app.bot))
@@ -1680,6 +1772,10 @@ async def post_stop(app: Application):
     await flush(app.bot)  # آخر حفظ قبل ما البوت يقفل
 
 
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Unhandled error while processing %s", update, exc_info=context.error)
+
+
 def main():
     if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         raise SystemExit("حط توكن البوت في BOT_TOKEN جوه bot.py (أو في ملف .env) الأول.")
@@ -1690,6 +1786,7 @@ def main():
         .post_stop(post_stop)
         .build()
     )
+    app.add_error_handler(on_error)
     app.add_handler(TypeHandler(Update, track_activity), group=-1)
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CommandHandler("start", start))
@@ -1707,6 +1804,7 @@ def main():
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("health", health_cmd))
+    app.add_handler(CommandHandler("checkpages", checkpages_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.LOCATION, on_location))
     app.add_handler(
