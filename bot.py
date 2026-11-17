@@ -1285,9 +1285,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_chat.id)
     schedule_reminder(context.application, user)
     await update.message.reply_text(WELCOME, parse_mode="HTML", reply_markup=main_menu())
-    await update.message.reply_text(
-        settings_text(user), parse_mode="HTML", reply_markup=settings_menu()
-    )
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1491,7 +1488,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "howto":
         await bot.send_message(chat_id, HOWTO_TEXT, parse_mode="HTML")
     elif data == "menu":
-        await edit_or_send(q, bot, "القائمة", main_menu())
+        await edit_or_send(q, bot, WELCOME, main_menu())
     elif data == "settings":
         await edit_or_send(q, bot, settings_text(u), settings_menu())
     elif data == "progress":
