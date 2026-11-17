@@ -62,6 +62,10 @@ DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Africa/Cairo")
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "page_cache"))
 CACHE_DIR.mkdir(exist_ok=True)
 ZOOM = float(os.getenv("RENDER_ZOOM", "2.0"))
+# صفحات المصحف متخزّنة كصور في قناة تليجرام، وروابطها (صفحة -> رابط الرسالة) في الملف ده.
+PAGE_LINKS_FILE = os.getenv("PAGE_LINKS_FILE", "page_links.json")
+# اختياري: لو الملف فيه أرقام رسايل بس من غير روابط، حط ID القناة هنا (زي -1001234567890).
+STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID", "0")) or None
 
 # الجروب اللي بيتثبّت فيه ملف النسخة الاحتياطية (البوت لازم يكون أدمن فيه
 # بصلاحية تثبيت الرسايل ومسحها).
@@ -529,6 +533,62 @@ async def autosave_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ───────────────────────── صفحات المصحف ─────────────────────────
+LINK_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me)/(?:c/(\d+)|([A-Za-z]\w{3,}))/(?:\d+/)?(\d+)"
+)
+
+
+def parse_link(text) -> tuple | None:
+    """https://t.me/c/123456/45 -> (-100123456, 45) ، و t.me/username/45 -> (@username, 45)."""
+    m = LINK_RE.search(str(text))
+    if not m:
+        return None
+    internal, username, mid = m.groups()
+    return (int(f"-100{internal}") if internal else f"@{username}", int(mid))
+
+
+def _to_ref(v) -> tuple | None:
+    if isinstance(v, dict):
+        v = v.get("link") or v.get("url") or v.get("message_id")
+    if isinstance(v, str) and (ref := parse_link(v)):
+        return ref
+    if STORAGE_CHANNEL_ID and str(v).strip().isdigit():
+        return (STORAGE_CHANNEL_ID, int(str(v).strip()))
+    return None
+
+
+def load_page_links(path: Path | None = None) -> dict:
+    """{رقم الصفحة: (القناة, رقم الرسالة)}. بيقبل JSON (dict أو list) أو ملف نصي."""
+    path = path or Path(PAGE_LINKS_FILE)
+    if not path.exists():
+        return {}
+    raw = path.read_text(encoding="utf-8-sig")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        items = list(data.items())
+    elif isinstance(data, list):
+        items = list(enumerate(data, 1))  # أول عنصر = صفحة ١
+    else:  # ملف نصي: سطر لكل صفحة، إما "٥ <رابط>" أو الرابط لوحده بالترتيب
+        items = []
+        for n, line in enumerate((ln for ln in raw.splitlines() if ln.strip()), 1):
+            m = re.match(r"^\s*(\d+)\s*[:=,\t ]\s*(\S.*)$", line)
+            items.append((m.group(1), m.group(2)) if m else (n, line))
+    links = {}
+    for k, v in items:
+        try:
+            page = int(en_digits(str(k)))
+        except ValueError:
+            continue
+        ref = _to_ref(v)
+        if ref and 1 <= page <= TOTAL_PAGES:
+            links[page] = ref
+    return links
+
+
+PAGE_LINKS = load_page_links()
 _pdf = None  # بيتفتح بس لو صفحة مش موجودة في الكاش واحتجنا نرسمها من الـ PDF
 
 
@@ -545,7 +605,11 @@ def _get_pdf():
 
 
 def missing_cached_pages() -> list[int]:
-    return [p for p in range(1, TOTAL_PAGES + 1) if not (CACHE_DIR / f"{p}.jpg").exists()]
+    """صفحات مالهاش لا رابط في القناة ولا صورة في الكاش."""
+    return [
+        p for p in range(1, TOTAL_PAGES + 1)
+        if p not in PAGE_LINKS and not (CACHE_DIR / f"{p}.jpg").exists()
+    ]
 
 
 def today_pages(user: dict) -> list[int]:
@@ -572,7 +636,7 @@ def render_page(page_no: int) -> Path:
     return out
 
 
-async def send_pages(bot, chat_id: int, pages: list[int]):
+async def send_pages_local(bot, chat_id: int, pages: list[int]):
     paths = await asyncio.to_thread(lambda: [render_page(p) for p in pages])
     # الألبوم في تليجرام بيشيل ١٠ صور بالكتير.
     for i in range(0, len(paths), 10):
@@ -587,6 +651,36 @@ async def send_pages(bot, chat_id: int, pages: list[int]):
                 for p, path in chunk
             ]
             await bot.send_media_group(chat_id, media)
+
+
+async def send_pages(bot, chat_id: int, pages: list[int]):
+    """بيبعت الصفحات بالترتيب: اللي ليها رابط في قناة التخزين بتتنسخ منها مباشرة
+    (من غير تحميل أو رفع)، واللي مالهاش بتتبعت من الكاش/الـ PDF."""
+    i = 0
+    while i < len(pages):
+        if pages[i] in PAGE_LINKS:
+            src = PAGE_LINKS[pages[i]][0]
+            mids = []
+            while (
+                i < len(pages)
+                and len(mids) < 100  # حد تليجرام لنسخ الرسايل في طلب واحد
+                and pages[i] in PAGE_LINKS
+                and PAGE_LINKS[pages[i]][0] == src
+            ):
+                mids.append(PAGE_LINKS[pages[i]][1])
+                i += 1
+            sent = await bot.copy_messages(chat_id, src, mids)
+            if len(sent) < len(mids):
+                log.warning(
+                    "Only %d of %d pages were copied from %s (deleted or wrong message ids?)",
+                    len(sent), len(mids), src,
+                )
+        else:
+            run = []
+            while i < len(pages) and pages[i] not in PAGE_LINKS:
+                run.append(pages[i])
+                i += 1
+            await send_pages_local(bot, chat_id, run)
 
 
 # ───────────────────────── أدوات مساعدة ─────────────────────────
@@ -1548,18 +1642,23 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     global save_lock, outbox, outbox_task, APP
     APP = app
+    log.info("Loaded %d page links from %s.", len(PAGE_LINKS), PAGE_LINKS_FILE)
+    for src in {ref[0] for ref in PAGE_LINKS.values()}:
+        try:
+            await app.bot.get_chat(src)
+        except TelegramError as e:
+            log.warning(
+                "Cannot access storage channel %s: %s — add the bot as an admin there.", src, e
+            )
     missing = missing_cached_pages()
     if missing:
-        if Path(QURAN_PDF).exists():
-            log.info("%d pages not cached yet; they'll be rendered from the PDF on demand.", len(missing))
-        else:
-            log.warning(
-                "%d of %d page images are missing from %s/ and there is no PDF (%s): "
-                "those pages can't be sent. First missing: %s",
-                len(missing), TOTAL_PAGES, CACHE_DIR, QURAN_PDF, missing[:10],
-            )
+        log.warning(
+            "%d of %d pages have no link and no cached image, so they can't be sent. "
+            "First missing: %s",
+            len(missing), TOTAL_PAGES, missing[:10],
+        )
     else:
-        log.info("All %d page images found in %s/.", TOTAL_PAGES, CACHE_DIR)
+        log.info("All %d pages are available.", TOTAL_PAGES)
     save_lock = asyncio.Lock()
     outbox = Outbox()
     await restore_state(app.bot)
