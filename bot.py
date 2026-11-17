@@ -23,7 +23,6 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import fitz  # PyMuPDF
 from dotenv import load_dotenv
 from telegram import (
     InlineKeyboardButton,
@@ -530,7 +529,23 @@ async def autosave_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ───────────────────────── صفحات المصحف ─────────────────────────
-_pdf = fitz.open(QURAN_PDF)
+_pdf = None  # بيتفتح بس لو صفحة مش موجودة في الكاش واحتجنا نرسمها من الـ PDF
+
+
+def _get_pdf():
+    global _pdf
+    if _pdf is None:
+        if not Path(QURAN_PDF).exists():
+            raise FileNotFoundError(
+                f"Page image missing from {CACHE_DIR}/ and no PDF found at '{QURAN_PDF}'."
+            )
+        import fitz  # PyMuPDF
+        _pdf = fitz.open(QURAN_PDF)
+    return _pdf
+
+
+def missing_cached_pages() -> list[int]:
+    return [p for p in range(1, TOTAL_PAGES + 1) if not (CACHE_DIR / f"{p}.jpg").exists()]
 
 
 def today_pages(user: dict) -> list[int]:
@@ -550,7 +565,8 @@ def render_page(page_no: int) -> Path:
         if not out.exists():
             # بنكتب في ملف مؤقت وبعدين نبدّله، عشان محدش يقرا صورة نصها مكتوب.
             tmp = out.with_name(f"{page_no}.tmp.jpg")
-            pix = _pdf[page_no - 1 + PDF_OFFSET].get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM))
+            import fitz  # PyMuPDF
+            pix = _get_pdf()[page_no - 1 + PDF_OFFSET].get_pixmap(matrix=fitz.Matrix(ZOOM, ZOOM))
             pix.save(str(tmp), jpg_quality=88)
             tmp.replace(out)
     return out
@@ -1532,6 +1548,18 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     global save_lock, outbox, outbox_task, APP
     APP = app
+    missing = missing_cached_pages()
+    if missing:
+        if Path(QURAN_PDF).exists():
+            log.info("%d pages not cached yet; they'll be rendered from the PDF on demand.", len(missing))
+        else:
+            log.warning(
+                "%d of %d page images are missing from %s/ and there is no PDF (%s): "
+                "those pages can't be sent. First missing: %s",
+                len(missing), TOTAL_PAGES, CACHE_DIR, QURAN_PDF, missing[:10],
+            )
+    else:
+        log.info("All %d page images found in %s/.", TOTAL_PAGES, CACHE_DIR)
     save_lock = asyncio.Lock()
     outbox = Outbox()
     await restore_state(app.bot)
